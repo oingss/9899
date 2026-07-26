@@ -160,7 +160,7 @@ jobs:
               --no-install-recommends
             apt-get install -y wpasupplicant
             apt-get install systemd-resolved -y --no-install-recommends
-            apt-get update -y
+            apt-get upgrade -y
 
             # 验证关键包
             dpkg -l openssh-server network-manager rsync | grep -c '^ii' | grep -q '^3$' || {
