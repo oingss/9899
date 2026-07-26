@@ -1426,6 +1426,8 @@ download_kernel
 echo -e "${INFO} [ ${#build_armbian[@]} ] lists of Armbian board: [ $(echo ${build_armbian[@]} | xargs) ]"
 echo -e "${INFO} ROOTFS type: [ ${rootfs_type} ]"
 echo -e "${INFO} Kernel Repo: [ ${kernel_repo} ], Kernel Usage: [ ${kernel_usage} ] \n"
+# Ensure output directory exists (needed for df space checks before build creates files)
+mkdir -p "${armbian_outputpath}"
 # Show server start information
 echo -e "${INFO} Server space usage before starting to compile: \n$(df -hT ${armbian_outputpath}) \n"
 
