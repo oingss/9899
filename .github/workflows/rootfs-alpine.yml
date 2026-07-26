@@ -16,14 +16,12 @@ on:
   workflow_dispatch:
     inputs:
       alpine_release:
-        description: "Alpine 版本（edge=滚动, v3.20/v3.21=稳定版）"
+        description: "Alpine 版本（latest-stable=最新稳定版, edge=滚动版）"
         required: false
-        default: "edge"
+        default: "latest-stable"
         type: choice
         options:
-          - edge
-          - v3.21
-          - v3.20
+          - latest-stable
 
       root_password:
         description: "root 密码"
@@ -149,36 +147,48 @@ jobs:
           trap umount_chroot EXIT
 
           # ── 下载 Alpine 官方 aarch64 mini rootfs ──────────────────────
-          # 文件名规则：
-          #   edge    → alpine-minirootfs-edge-aarch64.tar.gz（固定名）
-          #   v3.21   → alpine-minirootfs-3.21.X-aarch64.tar.gz（X 是补丁号，需动态查询）
+          # 文件名规则（均需从目录列表查询，因为带补丁号）：
+          #   latest-stable → alpine-minirootfs-3.24.1-aarch64.tar.gz（跟随上游最新）
+          #   edge          → alpine-minirootfs-edge-aarch64.tar.gz（固定名，但仍查以防变更）
           #
           # 多镜像 fallback：
           #   1. dl-cdn.alpinelinux.org  — 官方 CDN（全球）
           #   2. mirrors.kernel.org      — kernel.org 镜像
           #   3. mirrors.tuna.tsinghua.edu.cn — 清华 TUNA（备用，回国可用）
 
-          ALPINE_FILE=""
+          DIR_URL="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_RELEASE}/releases/aarch64/"
+          echo "▶ 查询 ${ALPINE_RELEASE} 最新 minirootfs 文件名..."
+          echo "▶ 目录: ${DIR_URL}"
+
           if [[ "${ALPINE_RELEASE}" == "edge" ]]; then
-            # edge 版本文件名固定
+            # edge: 文件名固定为 alpine-minirootfs-edge-aarch64.tar.gz
             ALPINE_FILE="alpine-minirootfs-edge-aarch64.tar.gz"
           else
-            # 稳定版：从官方目录列表中查询最新补丁版本号
-            # 目录列表格式：<a href="alpine-minirootfs-3.21.7-aarch64.tar.gz">...
-            # 用 sort -V 按版本号排序，取最后一个（最新）
-            echo "▶ 查询 ${ALPINE_RELEASE} 最新 minirootfs 版本..."
-            DIR_URL="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_RELEASE}/releases/aarch64/"
-            LATEST_VER="$(curl -sL --max-time 30 "${DIR_URL}" \
+            # latest-stable: 从目录列表提取最新版本号（排除 _rc 预发布版）
+            # 目录列表格式：<a href="alpine-minirootfs-3.24.1-aarch64.tar.gz">...
+            ALPINE_FILE="$(curl -sL --max-time 30 "${DIR_URL}" \
               | grep -oE 'alpine-minirootfs-[0-9]+\.[0-9]+\.[0-9]+-aarch64\.tar\.gz' \
-              | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
               | sort -V | tail -1)"
-            if [[ -z "${LATEST_VER}" ]]; then
-              echo "::error::无法从 ${DIR_URL} 查询到 minirootfs 版本号"
+            if [[ -z "${ALPINE_FILE}" ]]; then
+              echo "::error::无法从 ${DIR_URL} 查询到 minirootfs 文件名"
               exit 1
             fi
-            ALPINE_FILE="alpine-minirootfs-${LATEST_VER}-aarch64.tar.gz"
-            echo "▶ 最新版本: ${LATEST_VER} → ${ALPINE_FILE}"
           fi
+          echo "▶ 目标文件: ${ALPINE_FILE}"
+
+          # 提取真实版本号用于 apk 源路径和标识
+          # 文件名格式：alpine-minirootfs-3.24.1-aarch64.tar.gz → 3.24.1
+          # apk 源路径需要 v3.24（主版本.次版本，加 v 前缀）
+          # edge 的 apk 源路径就是 edge
+          if [[ "${ALPINE_RELEASE}" == "edge" ]]; then
+            ALPINE_REPO_VER="edge"
+            ALPINE_VERSION_ID="edge"
+          else
+            ALPINE_VERSION_ID="$(echo "${ALPINE_FILE}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+            # 从 3.24.1 提取 v3.24（apk 仓库路径格式）
+            ALPINE_REPO_VER="v$(echo "${ALPINE_VERSION_ID}" | cut -d'.' -f1,2)"
+          fi
+          echo "▶ 真实版本: ${ALPINE_VERSION_ID} → apk 源路径: ${ALPINE_REPO_VER}"
 
           ALPINE_MIRRORS=(
             "https://dl-cdn.alpinelinux.org/alpine/${ALPINE_RELEASE}/releases/aarch64/${ALPINE_FILE}"
@@ -215,14 +225,14 @@ jobs:
           sudo sed -i 's/^[[:space:]]*//' "${ROOTFS_DIR}/etc/resolv.conf"
 
           # ── 配置 apk 源（多镜像）──────────────────────────────────────
+          # ALPINE_REPO_VER 是真实版本路径，如 v3.24 或 edge
           sudo mkdir -p "${ROOTFS_DIR}/etc/apk"
-          sudo tee "${ROOTFS_DIR}/etc/apk/repositories" > /dev/null << 'APK_REPO_EOF'
-          https://dl-cdn.alpinelinux.org/alpine/RELEASE_PLACEHOLDER/main
-          https://dl-cdn.alpinelinux.org/alpine/RELEASE_PLACEHOLDER/community
-          https://mirrors.kernel.org/alpine/RELEASE_PLACEHOLDER/main
-          https://mirrors.kernel.org/alpine/RELEASE_PLACEHOLDER/community
+          sudo tee "${ROOTFS_DIR}/etc/apk/repositories" > /dev/null << APK_REPO_EOF
+          https://dl-cdn.alpinelinux.org/alpine/${ALPINE_REPO_VER}/main
+          https://dl-cdn.alpinelinux.org/alpine/${ALPINE_REPO_VER}/community
+          https://mirrors.kernel.org/alpine/${ALPINE_REPO_VER}/main
+          https://mirrors.kernel.org/alpine/${ALPINE_REPO_VER}/community
           APK_REPO_EOF
-          sudo sed -i "s|RELEASE_PLACEHOLDER|${ALPINE_RELEASE}|g" "${ROOTFS_DIR}/etc/apk/repositories"
           sudo sed -i 's/^[[:space:]]*//' "${ROOTFS_DIR}/etc/apk/repositories"
 
           # ── mount chroot 挂载点 ───────────────────────────────────────
@@ -366,11 +376,11 @@ jobs:
           trap - EXIT
 
           # ── 恢复 apk 源 → 面向最终用户的官方 CDN ──────────────────────
-          sudo tee "${ROOTFS_DIR}/etc/apk/repositories" > /dev/null << 'APK_USER_EOF'
-          https://dl-cdn.alpinelinux.org/alpine/RELEASE_PLACEHOLDER/main
-          https://dl-cdn.alpinelinux.org/alpine/RELEASE_PLACEHOLDER/community
+          sudo tee "${ROOTFS_DIR}/etc/apk/repositories" > /dev/null << APK_USER_EOF
+          https://dl-cdn.alpinelinux.org/alpine/${ALPINE_REPO_VER}/main
+          https://dl-cdn.alpinelinux.org/alpine/${ALPINE_REPO_VER}/community
           APK_USER_EOF
-          sudo sed -i "s|RELEASE_PLACEHOLDER|${ALPINE_RELEASE}|g" "${ROOTFS_DIR}/etc/apk/repositories"
+          sudo sed -i 's/^[[:space:]]*//' "${ROOTFS_DIR}/etc/apk/repositories"
 
           # ── fstab ─────────────────────────────────────────────────────
           printf 'LABEL=ROOTFS\t/\text4\tdefaults,noatime,nodiratime,commit=600,errors=remount-ro\t0 1\n' \
@@ -384,22 +394,26 @@ jobs:
           # Alpine mini rootfs 的 /etc/os-release 可能有也可能没有 VERSION_CODENAME
           # 确保 ID=alpine 和 VERSION_CODENAME 存在
           if ! grep -q "^ID=alpine" "${ROOTFS_DIR}/etc/os-release" 2>/dev/null; then
-            sudo tee "${ROOTFS_DIR}/etc/os-release" > /dev/null << 'OSREL_EOF'
+            sudo tee "${ROOTFS_DIR}/etc/os-release" > /dev/null << OSREL_EOF
           NAME="Alpine Linux"
           ID=alpine
-          VERSION_ID=PLACEHOLDER
-          PRETTY_NAME="Alpine Linux"
+          VERSION_ID=${ALPINE_VERSION_ID}
+          PRETTY_NAME="Alpine Linux ${ALPINE_VERSION_ID}"
           HOME_URL="https://alpinelinux.org/"
           BUG_REPORT_URL="https://gitlab.alpinelinux.org/alpine/aports/-/issues"
           OSREL_EOF
-            sudo sed -i "s|PLACEHOLDER|${ALPINE_RELEASE}|g" "${ROOTFS_DIR}/etc/os-release"
+            sudo sed -i 's/^[[:space:]]*//' "${ROOTFS_DIR}/etc/os-release"
           fi
           # 确保 VERSION_CODENAME 存在（rebuild 需要它）
+          # 用真实版本号（如 3.24.1 或 edge）作为 codename
           if ! grep -q "^VERSION_CODENAME=" "${ROOTFS_DIR}/etc/os-release" 2>/dev/null; then
-            echo "VERSION_CODENAME=${ALPINE_RELEASE}" | sudo tee -a "${ROOTFS_DIR}/etc/os-release" > /dev/null
+            echo "VERSION_CODENAME=${ALPINE_VERSION_ID}" | sudo tee -a "${ROOTFS_DIR}/etc/os-release" > /dev/null
           fi
 
           echo "▶ rootfs 最终大小: $(sudo du -sh ${ROOTFS_DIR} | awk '{print $1}')"
+          # 导出到 job env，供后续打包/Release 步骤使用
+          echo "ALPINE_VERSION_ID=${ALPINE_VERSION_ID}" >> "${GITHUB_ENV}"
+          echo "ALPINE_REPO_VER=${ALPINE_REPO_VER}"     >> "${GITHUB_ENV}"
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
       # ── 4. 打包 rootfs tar.gz ────────────────────────────────────────
@@ -411,7 +425,7 @@ jobs:
           OUT_DIR="${GITHUB_WORKSPACE}/output"
           mkdir -p "${OUT_DIR}"
 
-          TARBALL="Alpine_${ALPINE_RELEASE}_rootfs.tar.gz"
+          TARBALL="Alpine_${ALPINE_VERSION_ID}_rootfs.tar.gz"
           echo "▶ 打包 → ${TARBALL} ..."
           sudo tar -czf "${OUT_DIR}/${TARBALL}" -C "${ROOTFS_DIR}" .
           echo "▶ 大小: $(du -sh ${OUT_DIR}/${TARBALL} | awk '{print $1}')"
@@ -432,8 +446,8 @@ jobs:
         uses: ncipollo/release-action@main
         if: ${{ steps.package_rootfs.outputs.status == 'success' && !cancelled() }}
         with:
-          tag: "rootfs-alpine-${{ env.ALPINE_RELEASE }}"
-          name: "RootFS · Alpine ${{ env.ALPINE_RELEASE }}"
+          tag: "rootfs-alpine-${{ env.ALPINE_VERSION_ID }}"
+          name: "RootFS · Alpine ${{ env.ALPINE_VERSION_ID }}"
           artifacts: |
             ${{ steps.package_rootfs.outputs.TARBALL_PATH }}
             ${{ steps.package_rootfs.outputs.SHA256_PATH }}
@@ -444,7 +458,7 @@ jobs:
 
             | 参数 | 值 |
             |------|-----|
-            | Alpine 版本 | `${{ env.ALPINE_RELEASE }}` |
+            | Alpine 版本 | `${{ env.ALPINE_VERSION_ID }}`（仓库: `${{ env.ALPINE_REPO_VER }}`） |
             | 时区 | `${{ env.TZ_VAL }}` |
             | 构建时间 | `${{ steps.package_rootfs.outputs.BUILT_DATE }}` |
             | 构建编号 | `#${{ github.run_number }}` |
@@ -456,6 +470,6 @@ jobs:
             ## 使用方式
             在 `rebuild` workflow 的 **rootfs_url** 填入：
             ```
-            https://github.com/${{ github.repository }}/releases/download/rootfs-alpine-${{ env.ALPINE_RELEASE }}/${{ steps.package_rootfs.outputs.TARBALL }}
+            https://github.com/${{ github.repository }}/releases/download/rootfs-alpine-${{ env.ALPINE_VERSION_ID }}/${{ steps.package_rootfs.outputs.TARBALL }}
             ```
             并选择 `distro = alpine`，指定目标 `board`。
