@@ -424,6 +424,9 @@ check_data() {
             else
                 value="${specific_kernel[@]}"
             fi
+        elif [[ "${#specific_kernel[@]}" -gt 0 ]]; then
+            # auto_kernel=true AND -k specified: use -k versions (still auto-query latest per series)
+            value="${specific_kernel[@]}"
         fi
 
         # Merge the same key values
@@ -674,7 +677,10 @@ confirm_version() {
 
     # Find the kernel list defined in the model database
     model_kernel=()
-    if [[ "${conf_kernel_list}" == "all" ]]; then
+    if [[ "${#specific_kernel[@]}" -gt 0 ]]; then
+        # -k parameter specified: use it instead of model database's KERNEL_TAGS
+        model_kernel=($(echo "${specific_kernel[@]}" | xargs -n1 | sed -E 's/^([0-9]+\.[0-9]+)(\.[a-z0-9]+)?$/\1.[0-9]+/'))
+    elif [[ "${conf_kernel_list}" == "all" ]]; then
         eval "model_kernel=(\"\${${conf_kernel_tags}_kernel[@]}\")"
         model_kernel=($(echo "${model_kernel[@]}" | xargs -n1 | sed -E 's/^([0-9]+\.[0-9]+)(\.[a-z0-9]+)?$/\1.[0-9]+/'))
     else
