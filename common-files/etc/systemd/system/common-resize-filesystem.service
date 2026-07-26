@@ -1,0 +1,15 @@
+[Unit]
+Description=Common rootfs resize on first boot
+After=local-fs.target
+Before=basic.target
+ConditionPathExists=!/var/lib/common-resize-done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/common/resize-filesystem start
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

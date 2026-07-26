@@ -1,0 +1,24 @@
+#!/sbin/openrc-run
+#==========================================================================
+# common-ramlog OpenRC service
+# RAM 日志管理：tmpfs/zram 挂载、日志同步
+#==========================================================================
+
+description="Common RAM log management (tmpfs/zram mount, log sync)"
+
+depend() {
+    need localmount
+    need modules
+}
+
+start() {
+    ebegin "Starting common RAM log"
+    /usr/lib/common/ramlog start
+    eend $?
+}
+
+stop() {
+    ebegin "Syncing RAM logs to disk"
+    /usr/lib/common/ramlog stop
+    eend $?
+}

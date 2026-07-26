@@ -1,0 +1,25 @@
+#!/sbin/openrc-run
+#==========================================================================
+# common-resize-filesystem OpenRC service
+# 首次启动扩容根文件系统（一次性）
+#==========================================================================
+
+description="Common rootfs resize on first boot"
+
+depend() {
+    need localmount
+    before net
+}
+
+start() {
+    # 仅在标记文件不存在时执行（oneshot 语义）
+    if [ ! -f /var/lib/common-resize-done ]; then
+        ebegin "Resizing root filesystem"
+        /usr/lib/common/resize-filesystem start
+        eend $?
+    fi
+}
+
+stop() {
+    return 0
+}

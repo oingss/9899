@@ -1,0 +1,23 @@
+#!/sbin/openrc-run
+#==========================================================================
+# common-hardware-optimize OpenRC service
+# 硬件优化：IRQ 平衡、I/O 调度器、cpufreq governor
+#==========================================================================
+
+description="Common hardware optimization (IRQ balance, I/O scheduler, cpufreq)"
+
+depend() {
+    need localmount
+    after modules
+    before net
+}
+
+start() {
+    ebegin "Applying hardware optimizations"
+    /usr/lib/common/hardware-optimization start
+    eend $?
+}
+
+stop() {
+    return 0
+}

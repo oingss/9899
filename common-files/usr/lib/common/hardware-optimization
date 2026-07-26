@@ -1,0 +1,222 @@
+#!/bin/bash
+#==========================================================================
+# 通用硬件优化脚本 (公共主体)
+# 适用平台: rockchip / amlogic / allwinner
+# 适用发行版: debian / ubuntu / arch (通过 distro include 适配)
+#
+# 关键改造: 去掉硬编码 IRQ 分配，改为读取 /etc/balance_irq 通用化
+#           配置文件由 different-files/<board>/rootfs/etc/balance_irq 提供
+#==========================================================================
+
+. /usr/lib/common/common-functions
+
+# ── I/O 调度器设置 (全平台通用) ────────────────────────────────────
+set_io_scheduler() {
+    KERNELID=$(uname -r | awk -F'.' '{print ($1 * 100) + $2}')
+    for i in $(lsblk -idn -o NAME | grep -v zram); do
+        read ROTATE < /sys/block/$i/queue/rotational 2>/dev/null || continue
+        case ${ROTATE} in
+            1) [[ $KERNELID -lt 420 ]] && sched=cfq || sched=bfq ;;
+            0) [[ $KERNELID -lt 420 ]] && sched=noop || sched=none ;;
+            *) continue ;;
+        esac
+        echo $sched > /sys/block/$i/queue/scheduler 2>/dev/null || true
+        echo "### [hw-opt] I/O scheduler: $sched for $i" >> "${Log}"
+    done
+}
+
+# ── logrotate 路径修正 (zram ramlog 场景) ──────────────────────────
+fix_logrotate_path() {
+    CheckDevice=$(for i in /var/log /var /; do findmnt -n -o SOURCE $i 2>/dev/null && break; done)
+    if [[ "${CheckDevice}" == *"/dev/zram"* || "${CheckDevice}" == *"-ramlog" ]]; then
+        for f in /etc/logrotate.d/*; do
+            [[ -f "${f}" ]] && sed -i "s|/var/log/|/var/log.hdd/|g" "${f}" 2>/dev/null || true
+        done
+        [[ -f /etc/logrotate.conf ]] && sed -i "s|/var/log/|/var/log.hdd/|g" /etc/logrotate.conf
+    else
+        for f in /etc/logrotate.d/*; do
+            [[ -f "${f}" ]] && sed -i "s|/var/log.hdd/|/var/log/|g" "${f}" 2>/dev/null || true
+        done
+        [[ -f /etc/logrotate.conf ]] && sed -i "s|/var/log.hdd/|/var/log/|g" /etc/logrotate.conf
+    fi
+}
+
+# ── cpufreq 权限修正 + governor 设置 ──────────────────────────────
+setup_cpufreq() {
+    for f in /sys/devices/system/cpu/cpufreq/*/cpuinfo_cur_freq; do
+        [[ -f "$f" ]] && chmod +r "$f" 2>/dev/null || true
+    done
+    [[ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq ]] && \
+        chmod +r /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq 2>/dev/null || true
+
+    # logrotate compress (distro 无关)
+    find /etc/logrotate.d/. -type f 2>/dev/null | xargs grep -H -c 'compress' 2>/dev/null | grep '0$' | \
+        cut -d':' -f1 | xargs -r -L1 sed -i '/{/ a compress' 2>/dev/null || true
+    [[ -f /etc/logrotate.conf ]] && sed -i "s/#compress/compress/" /etc/logrotate.conf 2>/dev/null || true
+
+    # CPU governor (从 /etc/default/cpufrequtils 读取；不存在则跳过)
+    if [[ -r /etc/default/cpufrequtils ]]; then
+        . /etc/default/cpufrequtils
+        for cluster in /sys/devices/system/cpu/cpufreq/policy*; do
+            [[ -e "${cluster}" ]] || break
+            if [[ -n "${GOVERNOR}" ]]; then
+                grep -q "${GOVERNOR}" "${cluster}/scaling_available_governors" 2>/dev/null && \
+                    [[ -w "${cluster}/scaling_governor" ]] && echo "${GOVERNOR}" > "${cluster}/scaling_governor"
+            fi
+            [[ -n "${MIN_SPEED}" && -w "${cluster}/scaling_min_freq" ]] && echo "${MIN_SPEED}" > "${cluster}/scaling_min_freq"
+            [[ -n "${MAX_SPEED}" && -w "${cluster}/scaling_max_freq" ]] && echo "${MAX_SPEED}" > "${cluster}/scaling_max_freq"
+        done
+    fi
+}
+
+# ── IRQ 亲和性配置 (从 /etc/balance_irq 读取) ─────────────────────
+# 配置文件格式 (与 ophub balethirq.pl 兼容):
+#   <device_name> <cpu_list>
+#
+#   device_name : 必须与 /proc/interrupts 最后一列完全一致
+#                  例如: eth0, eth2-0, xhci-hcd:usb1, ahci-dwc[fe220000.sata]
+#   cpu_list    : 1-indexed CPU 编号，多个用逗号分隔
+#                  1=CPU0(mask=1), 2=CPU1(mask=2), 3=CPU2(mask=4), 4=CPU3(mask=8) ...
+#                  例如: 3        → 仅 CPU2
+#                        1,2,3    → CPU0+CPU1+CPU2 (mask=7)
+#
+# 行首 # 为注释，空行忽略
+apply_balance_irq() {
+    local config="/etc/balance_irq"
+
+    # 优先调用 balethirq.pl (它还会处理 RPS / board_special_config)
+    if [[ -x /usr/sbin/balethirq.pl ]] && command -v perl >/dev/null 2>&1; then
+        /usr/sbin/balethirq.pl >> "${Log}" 2>&1 || true
+        echo "### [hw-opt] IRQ balance applied via balethirq.pl" >> "${Log}"
+        return 0
+    fi
+
+    # 回退: 纯 bash 实现 (仅 smp_affinity, 不含 RPS)
+    [[ -r "${config}" ]] || {
+        echo "### [hw-opt] No ${config}, skipping IRQ balance" >> "${Log}"
+        return 0
+    }
+
+    # 等待网卡 IRQ 出现 (最多 5 秒)
+    local i
+    for i in {1..5}; do
+        grep -qE 'eth[0-9]|end[0-9]' /proc/interrupts 2>/dev/null && break
+        sleep 1
+    done
+
+    local line name cpus cpu mask hex_mask irq_num matched
+    while IFS= read -r line; do
+        # 跳过注释行和空行
+        [[ "${line}" =~ ^[[:space:]]*# ]] && continue
+        [[ "${line}" =~ ^[[:space:]]*$ ]] && continue
+
+        # 解析: <name> <cpus>  (cpus 是逗号分隔的 1-indexed CPU 编号)
+        read -r name cpus _ <<< "${line}"
+        [[ -n "${name}" && -n "${cpus}" ]] || continue
+
+        # 计算 bitmask
+        mask=0
+        local IFS_OLD="${IFS}"
+        IFS=','
+        for cpu in ${cpus}; do
+            [[ "${cpu}" =~ ^[0-9]+$ ]] || continue
+            ((cpu < 1)) && cpu=1
+            ((cpu > 32)) && cpu=32
+            mask=$((mask | (1 << (cpu - 1))))
+        done
+        IFS="${IFS_OLD}"
+        ((mask == 0)) && continue
+        hex_mask=$(printf "%x" "${mask}")
+
+        # 在 /proc/interrupts 中查找设备名 (最后一列) 完全匹配的 IRQ
+        matched=0
+        while read -r irq_num; do
+            [[ "${irq_num}" =~ ^[0-9]+$ ]] || continue
+            if echo "${hex_mask}" > /proc/irq/${irq_num}/smp_affinity 2>/dev/null; then
+                matched=1
+            fi
+        done < <(awk -v name="${name}" 'NR>1 {
+            irq=$1; sub(/:/, "", irq);
+            devname=$NF;
+            if (devname == name) print irq;
+        }' /proc/interrupts)
+
+        ((matched)) && \
+            echo "### [hw-opt] IRQ balance: ${name} → mask 0x${hex_mask}" >> "${Log}"
+    done < "${config}"
+
+    # 对单队列网卡应用 RPS (sensible default, 不依赖 balethirq.pl)
+    apply_rps_default
+}
+
+# ── RPS 默认配置 (单队列网卡) ──────────────────────────────────────
+# 仅对单队列网卡 (无 rx-1) 启用 RPS, mask 设为全部 CPU
+apply_rps_default() {
+    local total_cpus cpu_mask eth
+    total_cpus=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)
+    [[ "${total_cpus}" -le 1 ]] && return 0
+    cpu_mask=$(( (1 << total_cpus) - 1 ))
+    local hex_mask=$(printf "%x" "${cpu_mask}")
+
+    local rps_total=0
+    for eth in /sys/class/net/eth* /sys/class/net/end*; do
+        [[ -d "${eth}" ]] || continue
+        local iface="${eth##*/}"
+        # 仅对单队列网卡 (无 rx-1) 启用
+        [[ -d "${eth}/queues/rx-0" && ! -d "${eth}/queues/rx-1" ]] || continue
+
+        if [[ -w "${eth}/queues/rx-0/rps_cpus" ]]; then
+            echo "${hex_mask}" > "${eth}/queues/rx-0/rps_cpus" 2>/dev/null && \
+                echo "### [hw-opt] RPS: ${iface} rx-0 → mask 0x${hex_mask}" >> "${Log}"
+        fi
+        if [[ -w "${eth}/queues/rx-0/rps_flow_cnt" ]]; then
+            echo 32768 > "${eth}/queues/rx-0/rps_flow_cnt" 2>/dev/null && \
+                rps_total=$((rps_total + 32768))
+        fi
+        if [[ -w "${eth}/queues/tx-0/xps_cpus" ]]; then
+            echo "${hex_mask}" > "${eth}/queues/tx-0/xps_cpus" 2>/dev/null || true
+        fi
+    done
+
+    if [[ ${rps_total} -gt 0 && -w /proc/sys/net/core/rps_sock_flow_entries ]]; then
+        echo "${rps_total}" > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null && \
+            echo "### [hw-opt] rps_sock_flow_entries=${rps_total}" >> "${Log}"
+    fi
+}
+
+# ── 板级准备 (合并 logrotate / cpufreq / IRQ) ─────────────────────
+prepare_board() {
+    fix_logrotate_path
+    setup_cpufreq
+    apply_balance_irq
+
+    echo "### [hw-opt] board preparation done (${BOARD}/${BOARDFAMILY})" >> "${Log}"
+}
+
+# ── 内核分支回写 (调用 distro include 的 get_kernel_branch) ────────
+update_branch_from_installed_kernel() {
+    local BRANCH=""
+    BRANCH="$(get_kernel_branch 2>/dev/null || true)"
+
+    if grep -q "^BRANCH=" "${RELEASE_FILE}" 2>/dev/null; then
+        [[ -n "${BRANCH}" ]] && sed -i "s|^BRANCH=.*|BRANCH=${BRANCH}|" "${RELEASE_FILE}"
+    else
+        [[ -n "${BRANCH}" ]] && echo "BRANCH=${BRANCH}" >> "${RELEASE_FILE}"
+    fi
+}
+
+# ── 入口 ──────────────────────────────────────────────────────────
+case $1 in
+    *start*)
+        touch "${Log}" 2>/dev/null || true
+        chmod 644 "${Log}" 2>/dev/null || true
+        set_io_scheduler &
+        prepare_board &
+        update_branch_from_installed_kernel &
+        wait
+        ;;
+    *)
+        echo "Usage: $0 start"
+        exit 0
+        ;;
+esac

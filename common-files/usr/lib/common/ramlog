@@ -1,0 +1,157 @@
+#!/bin/bash
+#==========================================================================
+# 通用 ramlog 脚本 (公共主体)
+# 适用发行版: debian / ubuntu / arch (通过 distro include 适配)
+# 将 /var/log 挂载到 zram 或 tmpfs, 减少对 SD/eMMC 的写入
+#==========================================================================
+
+. /usr/lib/common/common-functions
+
+SIZE=50M
+USE_RSYNC=true
+ENABLED=false
+HDD_LOG=/var/log.hdd
+
+[ -f /etc/default/ramlog ] && . /etc/default/ramlog
+
+[ "$ENABLED" != true ] && exit 0
+
+# Never touch anything below here. Only edit /etc/default/ramlog
+
+RAM_LOG=/var/log
+LOG2RAM_LOG="${HDD_LOG}/ramlog.log"
+LOG_OUTPUT="tee -a $LOG2RAM_LOG"
+
+isSafe() {
+    [ -d "$HDD_LOG" ] || { echo "ERROR: $HDD_LOG doesn't exist! Can't sync." >&2; exit 1; }
+}
+
+# RecreateLogs: 在崩溃后某些服务无目录/日志会启动失败, 这里确保目录存在
+RecreateLogs() {
+    local pkg dir file
+    for entry in "${RAMLOG_SERVICE_CHECKS[@]}"; do
+        # entry 格式: "pkg:dir1:file2:file3..."
+        IFS=':' read -r pkg rest <<< "${entry}"
+        check_if_installed "${pkg}" || continue
+        while IFS= read -r path; do
+            [[ -z "${path}" ]] && continue
+            if [[ "${path}" == */ ]] || [[ -z "${path##*/}" ]]; then
+                # 目录
+                [[ ! -d "${path}" ]] && mkdir -p "${path}"
+            else
+                # 文件
+                [[ ! -d "$(dirname "${path}")" ]] && mkdir -p "$(dirname "${path}")"
+                [[ ! -f "${path}" ]] && touch "${path}"
+            fi
+        done < <(echo "${rest}" | tr ':' '\n')
+    done
+    return 0
+}
+
+syncToDisk() {
+    isSafe
+
+    echo -e "\n\n$(date): Syncing logs to storage\n" | $LOG_OUTPUT
+
+    if [ "$USE_RSYNC" = true ]; then
+        rsync -aXWv \
+            --exclude "lost+found" --exclude ramlog.log \
+            --exclude 'journal*' --one-file-system \
+            --links \
+            ${XTRA_RSYNC_TO[@]+"${XTRA_RSYNC_TO[@]}"} \
+            "$RAM_LOG/" "$HDD_LOG/" 2>&1 | $LOG_OUTPUT
+    else
+        rm -f "$RAM_LOG/journal"
+        cp -rfup "$RAM_LOG" -T "$HDD_LOG" 2>&1 | $LOG_OUTPUT
+    fi
+    if [ ! -L "$RAM_LOG/journal" ] && [ -d "$RAM_LOG/journal" ]; then
+        # systemd-journald only exists on systemd distros; skip on OpenRC (Alpine)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop systemd-journald
+            if [ -d "$HDD_LOG/journal" ]; then
+                mv "$HDD_LOG/journal" "$HDD_LOG/journal-$(date +%Y%m%d-%T)"
+            fi
+            mv "$RAM_LOG/journal" "$HDD_LOG/journal"
+            systemctl start systemd-journald
+        fi
+    fi
+    if [ ! -L "$RAM_LOG/journal" ] && [ -d "$HDD_LOG/journal" ]; then
+        ln -s "${HDD_LOG}/journal" "${RAM_LOG}/"
+    fi
+    if [ -z "$(grep ^Storage=volatile /etc/systemd/journald.conf 2>/dev/null)" ]; then
+        journalctl --flush 2>/dev/null || true
+        journalctl --relinquish-var 2>/dev/null || true
+    fi
+
+    sync /
+}
+
+syncFromDisk() {
+    isSafe
+
+    echo -e "\n\n$(date): Loading logs from storage\n" | $LOG_OUTPUT
+
+    if [ "$USE_RSYNC" = true ]; then
+        rsync -aXWv --delete \
+            --exclude "lost+found" --exclude ramlog.log \
+            --exclude '*.gz' --exclude '*.xz' --exclude='*.[0-9]' \
+            --links \
+            --exclude 'journal*' --one-file-system \
+            ${XTRA_RSYNC_FROM[@]+"${XTRA_RSYNC_FROM[@]}"} \
+            "$HDD_LOG/" "$RAM_LOG/" 2>&1 | $LOG_OUTPUT
+    else
+        find "$HDD_LOG"/* -maxdepth 1 -type f -not \( -name '*.[0-9]' -or -name '*.xz*' -or -name '*.gz' -or -name 'journal*' \) 2>/dev/null \
+            | xargs -r cp -ut "$RAM_LOG/"
+    fi
+
+    if [ ! -L "$RAM_LOG/journal" ] && [ -d "$HDD_LOG/journal" ]; then
+        ln -s "${HDD_LOG}/journal" "${RAM_LOG}/"
+    fi
+    sync /
+}
+
+case "$1" in
+    start)
+        [ -d "$HDD_LOG" ] || mkdir -p "$HDD_LOG"
+        if [ "$HDD_LOG" == "/var/log.hdd" ]; then
+            mount --bind "$RAM_LOG" "$HDD_LOG"
+            mount --make-private "$HDD_LOG"
+        fi
+
+        # Check whether zram device is available or we need to use tmpfs
+        LOG_TYPE="tmpfs"
+        for rd in /dev/zram*; do
+            if [[ "$(e2label "$rd" 2>/dev/null)" == "log2ram" ]]; then
+                LOG_TYPE="zram"
+                break
+            fi
+        done
+        case $LOG_TYPE in
+            zram)
+                echo -e "Mounting $rd as $RAM_LOG \c" | $LOG_OUTPUT
+                mount -o discard,nosuid,noexec,nodev "$rd" "$RAM_LOG" 2>&1 | $LOG_OUTPUT
+                ;;
+            tmpfs)
+                echo -e "Setting up $RAM_LOG as tmpfs \c" | $LOG_OUTPUT
+                mount -t tmpfs -o nosuid,noexec,nodev,mode=0755,size=$SIZE "${RAMLOG_NAME}" "$RAM_LOG" 2>&1 | $LOG_OUTPUT
+                ;;
+        esac
+
+        syncFromDisk
+        RecreateLogs
+        ;;
+    stop)
+        syncToDisk
+        umount -l "$RAM_LOG" 2>/dev/null || true
+        if [ "$HDD_LOG" == "/var/log.hdd" ]; then
+            umount -l "$HDD_LOG" 2>/dev/null || true
+        fi
+        ;;
+    write)
+        syncToDisk
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|write}"
+        exit 1
+        ;;
+esac

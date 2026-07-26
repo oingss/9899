@@ -1,0 +1,25 @@
+#!/sbin/openrc-run
+#==========================================================================
+# common-firstrun OpenRC service
+# 首次启动初始化：SSH host keys 重生成、写入安装 UUID
+# 一次性服务（启动后自禁用）
+#==========================================================================
+
+description="Common first-run initialization (SSH keys, UUID)"
+
+depend() {
+    need localmount
+    after modules
+    after net
+}
+
+start() {
+    ebegin "Running common first-run initialization"
+    /usr/lib/common/firstrun start
+    eend $?
+}
+
+# OpenRC 的 stop 不需要做任何事（oneshot 语义）
+stop() {
+    return 0
+}

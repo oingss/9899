@@ -1,0 +1,14 @@
+[Unit]
+Description=Common hardware optimization (IRQ balance, I/O scheduler, cpufreq)
+After=local-fs.target systemd-modules-load.target
+Before=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/common/hardware-optimization start
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

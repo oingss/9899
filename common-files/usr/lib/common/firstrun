@@ -1,0 +1,41 @@
+#!/bin/bash
+#==========================================================================
+# 通用 firstrun 脚本 (公共主体)
+# 适用发行版: debian / ubuntu / arch (通过 distro include 适配)
+#==========================================================================
+
+. /usr/lib/common/common-functions
+
+case "$1" in
+    start)
+        # ── SSH host keys 重新生成 ──────────────────────────────────
+        # 调用 distro include 的 regenerate_ssh_keys()
+        if [[ -d /etc/ssh ]]; then
+            read entropy_before < /proc/sys/kernel/random/entropy_avail 2>/dev/null || entropy_before=0
+            rm -f /etc/ssh/ssh_host_*
+            regenerate_ssh_keys
+            service_ctl restart "${SSH_SERVICE}" 2>/dev/null || true
+            read entropy_after < /proc/sys/kernel/random/entropy_avail 2>/dev/null || entropy_after=0
+            echo "### [firstrun] SSH keys regenerated (entropy: ${entropy_before} -> ${entropy_after})" >> "${Log}"
+        fi
+
+        # ── 写入安装 UUID ───────────────────────────────────────────
+        if ! grep -q "^INSTALL_UUID=" "${RELEASE_FILE}" 2>/dev/null; then
+            UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"
+            [[ -n "${UUID}" ]] && echo "INSTALL_UUID=\"${UUID}\"" >> "${RELEASE_FILE}"
+            echo "### [firstrun] UUID=${UUID}" >> "${Log}"
+        fi
+
+        # ── 禁用 purple newt 背景 (distro 无关, 文件不存在则跳过) ────
+        [[ -f /etc/newt/palette ]] && sed -i 's/magenta/blue/g' /etc/newt/palette
+
+        # ── 自禁用 (一次性服务) ─────────────────────────────────────
+        service_ctl disable common-firstrun 2>/dev/null || true
+        echo "### [firstrun] done" >> "${Log}"
+        exit 0
+        ;;
+    *)
+        echo "Usage: $0 start"
+        exit 0
+        ;;
+esac

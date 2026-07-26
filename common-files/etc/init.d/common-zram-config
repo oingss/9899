@@ -1,0 +1,25 @@
+#!/sbin/openrc-run
+#==========================================================================
+# common-zram-config OpenRC service
+# zram 配置：swap、ramlog 分区、/tmp 压缩
+#==========================================================================
+
+description="Common zram swap + ramlog partition setup"
+
+depend() {
+    need localmount
+    need modules
+    before net
+}
+
+start() {
+    ebegin "Setting up zram devices"
+    /usr/lib/common/zram-config start
+    eend $?
+}
+
+stop() {
+    ebegin "Tearing down zram devices"
+    /usr/lib/common/zram-config stop 2>/dev/null
+    eend 0
+}
