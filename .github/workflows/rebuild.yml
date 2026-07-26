@@ -158,6 +158,9 @@ jobs:
           # 直接移到大盘，让 PWD/tmp_dir 天然落在大盘上
           sudo mv "${GITHUB_WORKSPACE}/rebuild" /builder/rebuild
           sudo ln -sfn /builder/rebuild "${GITHUB_WORKSPACE}/rebuild"
+          # unified_common_files = ${current_path}/common-files = /builder/rebuild/common-files
+          # 但 common-files 在仓库根目录，需要软链接让它可达
+          sudo ln -sfn "${GITHUB_WORKSPACE}/common-files" /builder/rebuild/common-files
           sudo chown -R runner:runner /builder/rebuild
           REBUILD_DIR="/builder/rebuild"
 
