@@ -149,24 +149,42 @@ jobs:
           trap umount_chroot EXIT
 
           # ── 下载 Alpine 官方 aarch64 mini rootfs ──────────────────────
+          # 文件名规则：
+          #   edge    → alpine-minirootfs-edge-aarch64.tar.gz（固定名）
+          #   v3.21   → alpine-minirootfs-3.21.X-aarch64.tar.gz（X 是补丁号，需动态查询）
+          #
           # 多镜像 fallback：
           #   1. dl-cdn.alpinelinux.org  — 官方 CDN（全球）
           #   2. mirrors.kernel.org      — kernel.org 镜像
           #   3. mirrors.tuna.tsinghua.edu.cn — 清华 TUNA（备用，回国可用）
-          ALPINE_MIRRORS=(
-            "https://dl-cdn.alpinelinux.org/alpine/${ALPINE_RELEASE}/releases/aarch64/alpine-minirootfs-${ALPINE_RELEASE}-aarch64.tar.gz"
-            "https://mirrors.kernel.org/alpine/${ALPINE_RELEASE}/releases/aarch64/alpine-minirootfs-${ALPINE_RELEASE}-aarch64.tar.gz"
-            "https://mirrors.tuna.tsinghua.edu.cn/alpine/${ALPINE_RELEASE}/releases/aarch64/alpine-minirootfs-${ALPINE_RELEASE}-aarch64.tar.gz"
-          )
 
-          # edge 版本的文件名不带版本号，需要特殊处理
+          ALPINE_FILE=""
           if [[ "${ALPINE_RELEASE}" == "edge" ]]; then
-            ALPINE_MIRRORS=(
-              "https://dl-cdn.alpinelinux.org/alpine/edge/releases/aarch64/alpine-minirootfs-edge-aarch64.tar.gz"
-              "https://mirrors.kernel.org/alpine/edge/releases/aarch64/alpine-minirootfs-edge-aarch64.tar.gz"
-              "https://mirrors.tuna.tsinghua.edu.cn/alpine/edge/releases/aarch64/alpine-minirootfs-edge-aarch64.tar.gz"
-            )
+            # edge 版本文件名固定
+            ALPINE_FILE="alpine-minirootfs-edge-aarch64.tar.gz"
+          else
+            # 稳定版：从官方目录列表中查询最新补丁版本号
+            # 目录列表格式：<a href="alpine-minirootfs-3.21.7-aarch64.tar.gz">...
+            # 用 sort -V 按版本号排序，取最后一个（最新）
+            echo "▶ 查询 ${ALPINE_RELEASE} 最新 minirootfs 版本..."
+            DIR_URL="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_RELEASE}/releases/aarch64/"
+            LATEST_VER="$(curl -sL --max-time 30 "${DIR_URL}" \
+              | grep -oE 'alpine-minirootfs-[0-9]+\.[0-9]+\.[0-9]+-aarch64\.tar\.gz' \
+              | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+              | sort -V | tail -1)"
+            if [[ -z "${LATEST_VER}" ]]; then
+              echo "::error::无法从 ${DIR_URL} 查询到 minirootfs 版本号"
+              exit 1
+            fi
+            ALPINE_FILE="alpine-minirootfs-${LATEST_VER}-aarch64.tar.gz"
+            echo "▶ 最新版本: ${LATEST_VER} → ${ALPINE_FILE}"
           fi
+
+          ALPINE_MIRRORS=(
+            "https://dl-cdn.alpinelinux.org/alpine/${ALPINE_RELEASE}/releases/aarch64/${ALPINE_FILE}"
+            "https://mirrors.kernel.org/alpine/${ALPINE_RELEASE}/releases/aarch64/${ALPINE_FILE}"
+            "https://mirrors.tuna.tsinghua.edu.cn/alpine/${ALPINE_RELEASE}/releases/aarch64/${ALPINE_FILE}"
+          )
 
           downloaded=0
           for url in "${ALPINE_MIRRORS[@]}"; do
