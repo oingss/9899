@@ -506,26 +506,9 @@ jobs:
         uses: ncipollo/release-action@main
         if: ${{ steps.package_rootfs.outputs.status == 'success' && !cancelled() }}
         with:
-          tag: "rootfs-arch-${{ env.ARCH_RELEASE }}"
-          name: "RootFS · Arch ${{ env.ARCH_RELEASE }}"
+          tag: "rootfs"
+          name: "RootFS"
           artifacts: |
             ${{ steps.package_rootfs.outputs.TARBALL_PATH }}
-            ${{ steps.package_rootfs.outputs.SHA256_PATH }}
           allowUpdates: true
           token: ${{ secrets.GITHUB_TOKEN }}
-          body: |
-            ## Arch Linux ARM rootfs（通用，不含机型/平台信息）
-
-            | 参数 | 值 |
-            |------|-----|
-            | 版本 | `${{ env.ARCH_RELEASE }}` (Arch Linux ARM) |
-            | 时区 | `${{ env.TZ_VAL }}` |
-            | 构建时间 | `${{ steps.package_rootfs.outputs.BUILT_DATE }}` |
-            | 构建编号 | `#${{ github.run_number }}` |
-
-            ## 使用方式
-            在 `rebuild` workflow 的 **rootfs_url** 填入：
-            ```
-            https://github.com/${{ github.repository }}/releases/download/rootfs-arch-${{ env.ARCH_RELEASE }}/${{ steps.package_rootfs.outputs.TARBALL }}
-            ```
-            并选择 `distro = arch`，指定目标 `board`。
