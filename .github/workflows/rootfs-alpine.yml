@@ -22,6 +22,7 @@ on:
         type: choice
         options:
           - latest-stable
+          - edge
 
       root_password:
         description: "root 密码"
