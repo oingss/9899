@@ -199,6 +199,7 @@ jobs:
                 echo 'ERROR: 关键包安装不完整'
                 exit 1
               }
+              apt-get upgrade -y
               apt-get clean && rm -rf /var/lib/apt/lists/*
             "
           else
