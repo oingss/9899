@@ -1,0 +1,47 @@
+#!/bin/bash
+#==========================================================================
+# 通用环境变量定义和公共函数
+# 所有 distro 共享，不包含任何 distro 特定逻辑
+# 被主体脚本 source，不直接执行
+#==========================================================================
+
+# ── 探测 distro 并加载 distro include ──────────────────────────────
+# 优先从 /etc/distro-id 读取（rebuild 时写入），回退到 /etc/os-release
+if [[ -f /etc/distro-id ]]; then
+    . /etc/distro-id
+else
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        DISTRO_ID="${ID}"
+    else
+        DISTRO_ID="unknown"
+    fi
+fi
+
+# source distro include
+if [[ -f "/usr/lib/common/distro/${DISTRO_ID}.sh" ]]; then
+    . "/usr/lib/common/distro/${DISTRO_ID}.sh"
+else
+    echo "ERROR: unsupported distro: ${DISTRO_ID}" >&2
+    DISTRO_ID="unknown"
+fi
+
+# ── 日志路径（由 distro include 提供）──────────────────────────────
+Log="${LOG_FILE:-/var/log/hardware-monitor.log}"
+
+# ── 硬件标识（从 release 文件读取，rebuild 时写入）──────────────────
+# release 文件路径由 distro include 提供
+if [[ -f "${RELEASE_FILE:-/etc/os-release}" ]]; then
+    . "${RELEASE_FILE}" 2>/dev/null || true
+fi
+
+# 默认值（rebuild 会覆盖）
+BOARD="${BOARD:-unknown}"
+BOARDFAMILY="${BOARDFAMILY:-unknown}"
+BOARD_NAME="${BOARD_NAME:-unknown}"
+
+# ── 基础目录确保存在 ──────────────────────────────────────────────
+[ ! -f "$Log" ] && touch "$Log" && chmod 644 "$Log"
+
+# ── 导出变量供全局使用 ────────────────────────────────────────────
+export Log BOARD BOARDFAMILY BOARD_NAME DISTRO_ID

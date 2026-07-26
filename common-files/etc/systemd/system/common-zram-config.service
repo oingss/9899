@@ -1,0 +1,14 @@
+[Unit]
+Description=Common zram swap + ramlog partition setup
+After=local-fs.target systemd-modules-load.service
+Before=swap.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/common/zram-config start
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

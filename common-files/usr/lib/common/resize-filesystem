@@ -1,0 +1,260 @@
+#!/bin/bash
+#==========================================================================
+# 通用 resize-filesystem 脚本 (公共主体)
+# 适用发行版: debian / ubuntu / arch (通过 distro include 适配)
+# 启动时自动扩展 rootfs 分区到 SD/eMMC 全部可用空间
+#==========================================================================
+
+. /usr/lib/common/common-functions
+
+do_expand_partition() {
+    local partdev=$1
+    echo -e "\n### [resize2fs] Trying to resize partition $partdev:\n"
+
+    local parttype=$(lsblk -n -d -o TYPE "$partdev" 2>/dev/null)
+    if [[ "$parttype" != "part" ]]; then
+        echo -e "\n$partdev isn't a partition: $parttype" >&2
+        return 1
+    fi
+
+    local diskdevname=$(lsblk -n -d -o PKNAME "$partdev" 2>/dev/null)
+    [[ -z $diskdevname ]] && diskdevname=$(echo "$partdev" | sed -e "s/^\/dev\///" | sed "s/p.*//")
+    local diskdev="/dev/$diskdevname"
+    echo "diskdevname: $diskdevname"
+    echo "diskdev: $diskdev"
+
+    local partindex="$(echo "$partdev" | sed "s|^$diskdev||" | sed 's/^p//')"
+    if [[ -n "$(echo "$partindex" | tr -d '[:digit:]')" ]]; then
+        echo -e "\nFail to detect partindex: $partindex" >&2
+        return 1
+    fi
+    echo "partindex: $partindex"
+
+    local partstart=$(parted "$diskdev" unit s print -sm 2>/dev/null | awk -F':' "NR>=3{if(\$1 == $partindex){print \$2}}" | sed 's/s//')
+    local partend=$(parted "$diskdev" unit s print -sm 2>/dev/null | awk -F':' "NR>=3{if(\$1 == $partindex){print \$3}}" | sed 's/s//')
+    if [[ -z "$partstart" ]] || [[ -z "$partend" ]]; then
+        echo -e "\nFail to find the target partition" >&2
+        return 1
+    fi
+    echo "partstart: ${partstart}s"
+    echo "partend: ${partend}s"
+
+    local list=$(parted "$diskdev" unit s print -sm 2>/dev/null | awk -F':' "NR>=3{if(\$2 - $partstart > 0){print \$1}}")
+    if [[ -n "$list" ]]; then
+        echo -e "\nThe target partition isn't the last partition in logical layout" >&2
+        echo "Partition ${list[*]} behind it" >&2
+        return 1
+    fi
+
+    local capacity=$(parted "$diskdev" unit s print -sm 2>/dev/null | awk -F':' 'NR==2{print $2}' | sed 's/s//')
+    local sectorsize=$(parted "$diskdev" unit s print -sm 2>/dev/null | awk -F':' 'NR==2{print $4}')
+    echo "capacity: ${capacity}s"
+    echo "sectorsize: ${sectorsize}B"
+
+    if [[ -f /root/.rootfs_resize ]]; then
+        read RESIZE_VALUE < /root/.rootfs_resize
+        echo "Resize rule $RESIZE_VALUE defined for root partition"
+        case $RESIZE_VALUE in
+            *%)
+                local percentage=$(echo "$RESIZE_VALUE" | tr -c -d '[:digit:]')
+                local lastsector=$(( capacity * percentage / 100 ))
+                ;;
+            *s)
+                local lastsector=$(echo "$RESIZE_VALUE" | tr -c -d '[:digit:]')
+                ;;
+            *B)
+                local byte=$(echo "$RESIZE_VALUE" | tr -c -d '[:digit:]')
+                local lastsector=$(( byte / sectorsize ))
+                ;;
+            *)
+                echo -e "\nUnknown rule: $RESIZE_VALUE" >&2
+                return 1
+                ;;
+        esac
+
+        if [[ $(( sectorsize * (capacity - lastsector) )) -ge $(( 1 * 1024 * 1024 * 1024 )) ]]; then
+            local newpartition=$(( capacity * 99 / 100 ))
+        fi
+    else
+        if [[ $(( sectorsize * capacity )) -lt $(( 4 * 1024 * 1024 * 1024 )) ]]; then
+            local lastsector=$(( capacity * 95 / 100 ))
+            echo "4GiB or smaller media - leaving 5% spare area"
+        elif [[ $(( sectorsize * capacity )) -lt $(( 8 * 1024 * 1024 * 1024 )) ]]; then
+            local lastsector=$(( capacity * 98 / 100 ))
+            echo "8GiB or smaller media - leaving 2% spare area"
+        else
+            local lastsector=$(( capacity * 99 / 100 ))
+            echo "Leaving 1% spare area"
+        fi
+    fi
+
+    local lastsector=$(( lastsector - (lastsector % (16 * 1024 * 1024 / sectorsize)) - 1 ))
+    [[ -n "$newpartition" ]] && local newpartition=$(( newpartition - (newpartition % (16 * 1024 * 1024 / sectorsize)) ))
+
+    if [[ $lastsector -lt $partend ]]; then
+        echo -e "\n${partend} is larger than ${lastsector}s, that means you trying to shrink filesystem. Sorry, this tool designed for expanding only." >&2
+        return 1
+    elif [[ $lastsector -eq $partend ]]; then
+        echo -e "\nSame size. Skip" >&2
+        return 0
+    fi
+    if [[ -n "$newpartition" && $newpartition -le $(( lastsector + 1 )) ]]; then
+        unset newpartition
+    fi
+
+    echo -e "Old partition table:\n"
+    cat /proc/partitions
+
+    echo -e "\nExecuting fdisk:"
+    local partnum=$(parted "$diskdev" unit s print -sm 2>/dev/null | awk 'END{print NR-2}')
+    local fdisk_version=$(fdisk --version 2>/dev/null | awk '{print $NF}' | grep -oE "^[[:digit:]]\.[[:digit:]]+")
+    if [[ $partnum == 1 ]] && awk "BEGIN{exit ! ($fdisk_version >= 2.27 )}" 2>/dev/null; then
+        {
+            echo d
+            echo n; echo p; echo "$partindex"; echo "$partstart"; echo "$lastsector"
+            echo w
+        } | fdisk "$diskdev" 2>&1
+    else
+        {
+            echo d; echo "$partindex"
+            echo n; echo p; echo "$partindex"; echo "$partstart"; echo "$lastsector"
+            echo w
+        } | fdisk "$diskdev" 2>&1
+    fi
+    if [[ -n "$newpartition" ]]; then
+        {
+            echo n; echo p; echo ""; echo $(( lastsector + 1 )); echo "$newpartition"
+            echo w
+        } | fdisk "$diskdev" 2>&1
+    fi
+
+    echo -e "\nExecuting partprobe:"
+    KERNELID=$(uname -r | awk -F'.' '{print ($1 * 100) + $2}')
+    if ! partprobe "$rootdev" 2>/dev/null && [[ ${KERNELID} -le 507 ]]; then
+        echo -e "\n### [resize2fs] Automated reboot needed to finish the resize procedure"
+        touch /var/run/resize2fs-reboot
+    fi
+
+    local partsize=$(lsblk -n -d -b -o SIZE "$partdev" 2>/dev/null)
+    local actualsize=$(( sectorsize * (lastsector - partstart + 1) ))
+    if [[ $actualsize -ne $partsize ]]; then
+        echo -e "\n### [resize2fs] Automated reboot needed to finish the resize procedure"
+        touch /var/run/resize2fs-reboot
+    fi
+
+    echo -e "New partition table:\n"
+    cat /proc/partitions
+
+    return 0
+}
+
+do_resize_crypt() {
+    local dev=$1
+    local parentdev=$2
+    local name=$(lsblk -n -d -o NAME "$dev" 2>/dev/null)
+
+    echo -e "\n### [resize2fs] Start resizing LUKS container now\n"
+    if [ -f /etc/rootfs.key ]; then
+        cryptsetup resize --key-file /etc/rootfs.key "$name" 2>/dev/null || true
+    else
+        cryptsetup resize "$name" 2>/dev/null || true
+    fi
+
+    local parentsize=$(lsblk -n -d -b -o SIZE "$parentdev" 2>/dev/null)
+    local sectorsize=$(cryptsetup status "$name" 2>/dev/null | awk -F':' '/^ *sector size/ {print $2}' | tr -c -d '[:digit:]')
+    local offset=$(cryptsetup status "$name" 2>/dev/null | awk -F':' '/^ *offset/ {print $2}' | tr -c -d '[:digit:]')
+    local size=$(cryptsetup status "$name" 2>/dev/null | awk -F':' '/^ *size/ {print $2}' | tr -c -d '[:digit:]')
+    [[ -z "$sectorsize" || -z "$offset" || -z "$size" ]] && return 0
+    local actualsize=$(( sectorsize * (offset + size) ))
+    if [[ $actualsize -ne $parentsize ]]; then
+        echo -e "\n### [resize2fs] Automated reboot needed to finish the resize procedure"
+        touch /var/run/resize2fs-reboot
+    fi
+}
+
+do_expand_filesystem() {
+    local partdev=$1
+    local mountpoint=$2
+
+    local fstype=$(findmnt -n -o FSTYPE "$mountpoint" 2>/dev/null)
+    echo -e "\n### [resize2fs] Trying to resize $fstype filesystem on $partdev:\n"
+
+    case $fstype in
+        ext4)
+            echo "Running 'resize2fs $partdev' now..."
+            resize2fs "$partdev" 2>&1
+            ;;
+        xfs)
+            echo "Running 'xfs_growfs $mountpoint' now..."
+            xfs_growfs "$mountpoint" 2>&1
+            ;;
+        btrfs)
+            echo "Running 'btrfs filesystem resize max $mountpoint' now..."
+            btrfs filesystem resize max "$mountpoint" 2>&1
+            ;;
+        nilfs2)
+            echo "Running 'nilfs-resize -v -y $partdev' now..."
+            nilfs-resize -v -y "$partdev" 2>&1
+            ;;
+        *)
+            echo "Unsupported filesystem: $fstype"
+            echo "Trying to run 'resize2fs $partdev' now..."
+            resize2fs "$partdev" 2>&1
+            return
+            ;;
+    esac
+
+    local devsize=$(lsblk -n -d -b -o SIZE "$partdev" 2>/dev/null)
+    local fssize=$(findmnt -n -b -o SIZE --target "$mountpoint" 2>/dev/null)
+    [[ -z "$devsize" || -z "$fssize" ]] && return 0
+    if [[ $(( 100 * fssize / devsize )) -lt 90 ]]; then
+        echo -e "\n### [resize2fs] Automated reboot needed to finish the resize procedure"
+        touch /var/run/resize2fs-reboot
+    fi
+}
+
+main() {
+    rm -f /var/run/resize2fs-reboot 2>/dev/null
+
+    CPU_ARCH=$(lscpu 2>/dev/null | awk '/Architecture/ {print $2}')
+    DISTRO_ARCH=$(get_arch 2>/dev/null || uname -m)
+    KERNELID=$(uname -r)
+    echo "$(date) | ${BOARD_NAME} | ${DISTRO_ARCH} | ${CPU_ARCH} | ${KERNELID}"
+
+    local rootdev=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's~\[.*\]~~')
+
+    local cryptname=""
+    if [[ "$(lsblk -n -d -o TYPE "$rootdev" 2>/dev/null)" == "crypt" ]]; then
+        local cryptname=$(lsblk -n -d -o NAME "$rootdev" 2>/dev/null)
+        local parent_uuid=$(cat /etc/crypttab 2>/dev/null | awk "{if(\$1 == \"$cryptname\"){print \$2}}" | sed 's/UUID=//')
+        local parentdev=$(blkid -U "$parent_uuid" 2>/dev/null)
+
+        [[ -n "$parentdev" ]] && do_expand_partition "$parentdev"
+        [[ -n "$parentdev" ]] && do_resize_crypt "$rootdev" "$parentdev"
+    else
+        # growroot (Debian initramfs-tools hook) 已经处理了分区扩展,
+        # 这种情况下我们只 resize2fs 文件系统本身.
+        if growroot_check; then
+            echo "partition resize skipped: growroot detected."
+        else
+            do_expand_partition "$rootdev"
+        fi
+    fi
+
+    do_expand_filesystem "$rootdev" "/"
+
+    [[ ! -f /var/run/resize2fs-reboot ]] && systemctl disable --now common-resize-filesystem 2>/dev/null || true
+    exit 0
+}
+
+case "$1" in
+    start)
+        touch "${Log}" 2>/dev/null || true
+        chmod 644 "${Log}" 2>/dev/null || true
+        main 2>&1 | tee -a "${Log}"
+        ;;
+    *)
+        echo "Usage: $0 start"
+        exit 0
+        ;;
+esac

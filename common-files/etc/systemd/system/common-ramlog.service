@@ -1,0 +1,18 @@
+[Unit]
+Description=Common RAM log (compressed /var/log in zram/tmpfs)
+DefaultDependencies=no
+After=local-fs.target systemd-modules-load.service
+Before=systemd-update-utmp.service sysinit.target shutdown.target
+Conflicts=shutdown.target
+After=systemd-journald.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/common/ramlog start
+ExecStop=/usr/lib/common/ramlog stop
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=sysinit.target

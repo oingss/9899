@@ -1,0 +1,126 @@
+#!/bin/bash
+#==========================================================================
+# 通用 zram-config 脚本 (公共主体)
+# 适用发行版: debian / ubuntu / arch (通过 distro include 适配)
+# 启用 zram swap + (可选) ramlog 分区 + 压缩 /tmp
+#==========================================================================
+
+. /usr/lib/common/common-functions
+
+# Read mkfs version as it behaves differently after v2.40.1 (Trixie / Plucky ->)
+# mkfs is used to create the zram devices and the ramlog partition
+MKFS_VERSION=$(LC_ALL=C mkfs --version 2>&1 | grep -Po 'util-linux\s+\K[0-9]+(\.[0-9]+)*' | head -n1)
+
+# script configuration (override via /etc/default/zram-config)
+ENABLED=false
+[ -f /etc/default/zram-config ] && . /etc/default/zram-config
+[[ "$ENABLED" != "true" ]] && exit 0
+# Exit if module not loaded
+if ! modinfo "zram" 2>/dev/null; then exit 0; fi
+
+activate_zram() {
+    # Load zram module with n instances for swap: one per CPU core, $ZRAM_MAX_DEVICES
+    # defines the maximum, on modern kernels we overwrite this with 1 and rely on
+    # max_comp_streams being set to count of CPU cores or $ZRAM_MAX_DEVICES
+    uname -r | grep -q '^3.' && zram_max_devs=${ZRAM_MAX_DEVICES:=4} || zram_max_devs=1
+    cpu_cores=$(grep -c '^processor' /proc/cpuinfo | sed 's/^0$/1/')
+    [[ ${cpu_cores} -gt ${zram_max_devs} ]] && zram_devices=${zram_max_devs} || zram_devices=${cpu_cores}
+    module_args="$(modinfo zram 2>/dev/null | awk -F" " '/num_devices/ {print $2}' | cut -f1 -d:)"
+    [[ -n ${module_args} ]] && modprobe zram ${module_args}=$(( zram_devices + 1 )) || return
+
+    swap_algo=${SWAP_ALGORITHM:=lzo}
+    zram_percent=${ZRAM_PERCENTAGE:=50}
+    mem_info=$(LC_ALL=C free -w 2>/dev/null | grep "^Mem" || LC_ALL=C free | grep "^Mem")
+    mem_info=$(echo $mem_info | awk '{print $2}')
+    memory_total=$(( mem_info * 1024 ))
+    mem_per_zram_device=$(( memory_total * zram_percent / zram_devices / 100 ))
+
+    mem_limit_percent=${MEM_LIMIT_PERCENTAGE:=50}
+    mem_limit_per_zram_device=$(( memory_total * mem_limit_percent / zram_devices / 100 ))
+}
+
+activate_zram_swap() {
+    [[ -n "$SWAP" && "$SWAP" != "true" ]] && return
+
+    [[ -f /sys/module/zswap/parameters/enabled ]] && echo 0 >/sys/module/zswap/parameters/enabled 2>/dev/null || true
+
+    sed -i "s/.*SystemMaxUse=$/SystemMaxUse=20M/" /etc/systemd/journald.conf 2>/dev/null || true
+
+    local i swap_device
+    for (( i=1; i<=zram_devices; i++ )); do
+        swap_device=$(zramctl -f 2>/dev/null | sed 's/\/dev\///')
+        [[ ! ${swap_device} =~ ^zram ]] && {
+            printf "\n### No more available zram devices (%s)\n" "${swap_device}" >> "${Log}"
+            exit 1
+        }
+        if [ -f /sys/block/${swap_device}/comp_algorithm ]; then
+            grep -q 'lzo-rle' /sys/block/${swap_device}/comp_algorithm && \
+                [[ "X${swap_algo}" = "Xlzo" ]] && swap_algo="lzo-rle"
+            echo ${swap_algo} >/sys/block/${swap_device}/comp_algorithm 2>/dev/null || true
+        fi
+        if [ "X${ZRAM_BACKING_DEV}" != "X" ]; then
+            echo ${ZRAM_BACKING_DEV} >/sys/block/${swap_device}/backing_dev 2>/dev/null || true
+        fi
+        echo -n ${ZRAM_MAX_DEVICES:=4} > /sys/block/${swap_device}/max_comp_streams 2>/dev/null || true
+        echo -n ${mem_per_zram_device} > /sys/block/${swap_device}/disksize 2>/dev/null || true
+        echo -n ${mem_limit_per_zram_device} > /sys/block/${swap_device}/mem_limit 2>/dev/null || true
+        mkswap /dev/${swap_device} 2>/dev/null || true
+        swapon -p 5 /dev/${swap_device} 2>/dev/null || true
+    done
+
+    echo 0 > /proc/sys/vm/page-cluster 2>/dev/null || true
+
+    printf "\n### Activated %s %s zram swap devices with %dMB each.\n" \
+        "${zram_devices}" "${swap_algo}" "$((mem_per_zram_device / 1048576))" >> "${Log}"
+}
+
+activate_ramlog_partition() {
+    # /dev/zram0 will be used as a compressed /var/log partition in RAM if
+    # ENABLED=true in /etc/default/ramlog is set
+    local ramlog_enabled
+    ramlog_enabled=$(awk -F"=" '/^ENABLED/ {print $2}' /etc/default/ramlog 2>/dev/null)
+    [[ "$ramlog_enabled" != "true" ]] && return
+
+    local log_device
+    log_device=$(zramctl -f 2>/dev/null | sed 's/\/dev\///')
+    [[ ! ${log_device} =~ ^zram ]] && {
+        printf "\n### No more available zram devices (%s)\n" "${log_device}" >> "${Log}"
+        exit 1
+    }
+
+    local ramlogsize disksize
+    ramlogsize=$(awk -F"=" '/^SIZE/ {print $2}' /etc/default/ramlog 2>/dev/null)
+    disksize=$(sed -e 's/M$/*1048576/' -e 's/K$/*1024/' <<<"${ramlogsize:=50M}" | bc)
+
+    if [ "X${RAMLOG_ALGORITHM}" = "X" ]; then
+        local algo
+        for algo in lz4 lz4hc quicklz zlib brotli zstd ; do
+            echo ${algo} >/sys/block/${log_device}/comp_algorithm 2>/dev/null || true
+        done
+    else
+        echo ${RAMLOG_ALGORITHM} >/sys/block/${log_device}/comp_algorithm 2>/dev/null || true
+    fi
+    echo -n ${disksize} > /sys/block/${log_device}/disksize 2>/dev/null || true
+
+    if compare_versions "$MKFS_VERSION" gt "2.40.1" 2>/dev/null; then
+        mkfs.ext4 -O ^has_journal -L log2ram /dev/${log_device} 2>/dev/null || true
+    else
+        mkfs.ext4 -O ^has_journal -s 1024 -L log2ram /dev/${log_device} 2>/dev/null || true
+    fi
+
+    local algo_used
+    algo_used=$(sed 's/.*\[\([^]]*\)\].*/\1/g' </sys/block/${log_device}/comp_algorithm 2>/dev/null)
+    printf "### Activated ramlog partition with %s compression\n" "${algo_used}" >> "${Log}"
+}
+
+case $1 in
+    *start*)
+        activate_zram
+        activate_zram_swap
+        activate_ramlog_partition
+        ;;
+    *)
+        echo "Usage: $0 start"
+        exit 0
+        ;;
+esac
