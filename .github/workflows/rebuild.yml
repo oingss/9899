@@ -174,7 +174,7 @@ jobs:
             -k ${KERNEL} \
             -a true \
             -t ${FSTYPE} \
-            -s 256/745 \
+            -s 256/1024 \
             -r ${ROOTFS_DIR} \
             -d ${DISTRO} \
             -n ${BUILDER}
