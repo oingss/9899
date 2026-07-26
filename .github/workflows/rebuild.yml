@@ -1,0 +1,214 @@
+#==========================================================================
+# 用途：用已构建好的 rootfs 进行 rebuild，生成可烧录固件（支持多机型）
+#
+# 输入：rootfs_url（来自 rootfs-* workflow 的 Release）
+# 输出：*.img.gz 固件 → 发布到 Release tag: firmware-{board}-{distro}
+#
+# 支持 -b 参数：
+#   panther-x2        指定单机型
+#   all               全部 130 个机型
+#   rockchip          全部 rockchip 机型（94 个）
+#   amlogic           全部 amlogic 机型（30 个）
+#   allwinner         全部 allwinner 机型（6 个）
+#   rockchip_0_5      前 5 个 rockchip 机型（范围切片）
+#==========================================================================
+name: Rebuild Firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      rootfs_url:
+        description: "rootfs tar.gz 下载地址（必填，来自 rootfs-* workflow 的 Release）"
+        required: true
+        type: string
+
+      distro:
+        description: "rootfs 发行版（必须与 rootfs_url 对应）"
+        required: true
+        type: choice
+        options:
+          - debian
+          - ubuntu
+          - arch
+
+      board:
+        description: "目标机型（支持：panther-x2 / all / rockchip / amlogic / allwinner / rockchip_0_5）"
+        required: false
+        default: "panther-x2"
+        type: string
+
+      armbian_kernel:
+        description: "内核版本"
+        required: false
+        default: "6.18.y"
+        type: choice
+        options:
+          - 6.18.y
+          - 6.12.y
+          - 6.1.y
+
+      armbian_fstype:
+        description: "rootfs 文件系统类型"
+        required: false
+        default: "ext4"
+        type: choice
+        options:
+          - ext4
+          - btrfs
+
+      builder_name:
+        description: "构建者签名"
+        required: false
+        default: "mybuilder"
+        type: string
+
+env:
+  TZ: UTC
+  ROOTFS_DIR: /builder/rootfs-input
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    if: ${{ github.event.repository.owner.id == github.event.sender.id }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 1. 初始化环境 ──────────────────────────────────────────────────
+      - name: Initialize environment
+        id: init
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          docker rmi -f $(docker images -q) 2>/dev/null || true
+          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
+          sudo swapoff -a && sudo rm -f /swapfile /mnt/swapfile
+
+          sudo -E apt-get -y update
+          sudo -E apt-get -y purge \
+            azure-cli ghc* zulu* llvm* firefox google* dotnet* \
+            powershell openjdk* mongodb* moby* 2>/dev/null || true
+          sudo -E apt-get -y install \
+            parted e2fsprogs dosfstools btrfs-progs \
+            u-boot-tools uuid-runtime openssl pigz \
+            git curl wget xz-utils lz4 zstd pv jq rsync
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get clean
+          sudo -E timedatectl set-timezone "${TZ}"
+
+          echo "DISTRO=${{ inputs.distro }}"          >> "${GITHUB_ENV}"
+          echo "BOARD=${{ inputs.board }}"             >> "${GITHUB_ENV}"
+          echo "ROOTFS_URL=${{ inputs.rootfs_url }}"   >> "${GITHUB_ENV}"
+          echo "status=success" >> "${GITHUB_OUTPUT}"
+
+      # ── 2. 合并磁盘空间 ───────────────────────────────────────────────
+      - name: Create build disk
+        if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
+        run: |
+          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 1)
+          root_size=$(expr $(df -h / | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 4)
+          sudo truncate -s "${mnt_size}G"  /mnt/mnt.img
+          sudo truncate -s "${root_size}G" /root.img
+          sudo losetup /dev/loop6 /mnt/mnt.img
+          sudo losetup /dev/loop7 /root.img
+          sudo pvcreate /dev/loop6 /dev/loop7
+          sudo vgcreate github /dev/loop6 /dev/loop7
+          sudo lvcreate -n runner -l 100%FREE github
+          sudo mkfs.xfs -f -i sparse=0 /dev/github/runner
+          sudo mkdir -p /builder
+          sudo mount /dev/github/runner /builder
+          sudo chown -R runner:runner /builder
+          echo "可用空间: $(df -h /builder | tail -1 | awk '{print $4}')"
+
+      # ── 3. 下载 rootfs ───────────────────────────────────────────────
+      - name: Download rootfs
+        id: download_rootfs
+        if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "${ROOTFS_DIR}"
+          echo "▶ 下载 rootfs: ${ROOTFS_URL}"
+          wget -q --show-progress -O /tmp/rootfs.tar.gz "${ROOTFS_URL}"
+          echo "▶ 解压..."
+          sudo tar -xf /tmp/rootfs.tar.gz -C "${ROOTFS_DIR}"
+          rm -f /tmp/rootfs.tar.gz
+          [[ -d "${ROOTFS_DIR}/etc" ]] || { echo "::error::rootfs 结构非法，缺少 /etc"; exit 1; }
+          echo "▶ 解压完成: $(sudo du -sh ${ROOTFS_DIR} | awk '{print $1}')"
+          echo "status=success" >> "${GITHUB_OUTPUT}"
+
+      # ── 4. Rebuild：注入内核 + uboot + 统一平台脚本 ──────────────────
+      # rebuild 脚本通过 -r <rootfs_dir> 直接接收 rootfs 目录，跳过镜像打包/解包
+      # 通过 -d <distro> 指定发行版，rebuild 会写入 /etc/distro-id 并启用统一 common-* 服务
+      # 通过 -b <board> 指定机型（支持 all/rockchip/amlogic/allwinner/单机型/范围切片）
+      - name: Rebuild image
+        id: rebuild
+        if: ${{ steps.download_rootfs.outputs.status == 'success' && !cancelled() }}
+        env:
+          KERNEL: ${{ inputs.armbian_kernel }}
+          FSTYPE: ${{ inputs.armbian_fstype }}
+          BUILDER: ${{ inputs.builder_name }}
+        run: |
+          set -euo pipefail
+
+          # rebuild 执行时会 rm -rf tmp_dir 再 mkdir，软链接会被破坏
+          # 直接移到大盘，让 PWD/tmp_dir 天然落在大盘上
+          sudo mv "${GITHUB_WORKSPACE}/rebuild" /builder/rebuild
+          sudo ln -sfn /builder/rebuild "${GITHUB_WORKSPACE}/rebuild"
+          sudo chown -R runner:runner /builder/rebuild
+          REBUILD_DIR="/builder/rebuild"
+
+          sudo chmod +x "${REBUILD_DIR}/rebuild"
+          cd "${REBUILD_DIR}"
+
+          echo "▶ 执行: sudo ./rebuild -b ${BOARD} -k ${KERNEL} -a true -t ${FSTYPE} -s 256/1256 -r ${ROOTFS_DIR} -d ${DISTRO} -n ${BUILDER}"
+          sudo ./rebuild \
+            -b ${BOARD} \
+            -k ${KERNEL} \
+            -a true \
+            -t ${FSTYPE} \
+            -s 256/1256 \
+            -r ${ROOTFS_DIR} \
+            -d ${DISTRO} \
+            -n ${BUILDER}
+
+          OUTPUT_DIR="${REBUILD_DIR}/build/output/images"
+          echo "▶ 生成的固件:"
+          ls -lh "${OUTPUT_DIR}/"
+
+          IMG_COUNT=$(ls ${OUTPUT_DIR}/*.img.gz 2>/dev/null | wc -l)
+          [[ "${IMG_COUNT}" -gt 0 ]] || { echo "::error::rebuild 未生成 .img.gz"; exit 1; }
+          echo "▶ 共 ${IMG_COUNT} 个固件"
+
+          echo "PACKAGED_OUTPUTPATH=${OUTPUT_DIR}" >> "${GITHUB_ENV}"
+          echo "PACKAGED_STATUS=success"           >> "${GITHUB_ENV}"
+          echo "IMG_COUNT=${IMG_COUNT}"            >> "${GITHUB_ENV}"
+
+      # ── 5. 发布固件到 Release ────────────────────────────────────────
+      - name: Release firmware
+        uses: ncipollo/release-action@main
+        if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
+        with:
+          tag: "firmware-${{ env.BOARD }}-${{ env.DISTRO }}"
+          name: "Firmware · ${{ env.BOARD }} · ${{ env.DISTRO }}"
+          artifacts: "${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz*"
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ## 固件构建（${{ env.BOARD }}）
+
+            | 参数 | 值 |
+            |------|-----|
+            | 发行版 | `${{ env.DISTRO }}` |
+            | 机型 | `${{ env.BOARD }}` |
+            | 内核 | `${{ inputs.armbian_kernel }}` |
+            | 文件系统 | `${{ inputs.armbian_fstype }}` |
+            | 来源 rootfs | `${{ inputs.rootfs_url }}` |
+            | 固件数量 | `${{ env.IMG_COUNT }}` |
+            | 构建编号 | `#${{ github.run_number }}` |
+
+            > 固件可直接烧录到 SD 卡 / eMMC。
+            > 多机型构建（-b all/rockchip/amlogic/allwinner）时，所有机型的 .img.gz 均发布到此 Release。
