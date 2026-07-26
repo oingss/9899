@@ -196,23 +196,8 @@ jobs:
         uses: ncipollo/release-action@main
         if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
         with:
-          tag: "firmware-${{ env.BOARD }}-${{ env.DISTRO }}"
-          name: "Firmware · ${{ env.BOARD }} · ${{ env.DISTRO }}"
+          tag: "firmware"
+          name: "Firmware"
           artifacts: "${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz*"
           allowUpdates: true
           token: ${{ secrets.GITHUB_TOKEN }}
-          body: |
-            ## 固件构建（${{ env.BOARD }}）
-
-            | 参数 | 值 |
-            |------|-----|
-            | 发行版 | `${{ env.DISTRO }}` |
-            | 机型 | `${{ env.BOARD }}` |
-            | 内核 | `${{ inputs.armbian_kernel }}` |
-            | 文件系统 | `${{ inputs.armbian_fstype }}` |
-            | 来源 rootfs | `${{ inputs.rootfs_url }}` |
-            | 固件数量 | `${{ env.IMG_COUNT }}` |
-            | 构建编号 | `#${{ github.run_number }}` |
-
-            > 固件可直接烧录到 SD 卡 / eMMC。
-            > 多机型构建（-b all/rockchip/amlogic/allwinner）时，所有机型的 .img.gz 均发布到此 Release。
