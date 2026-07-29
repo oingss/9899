@@ -1,0 +1,29 @@
+name: Test
+on:
+  workflow_dispatch:        # 允许手动触发
+
+jobs:
+  # ── arm64-v8a Release ────────────────────────────────────────────
+  build-arm64:
+    name: 123
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all APK artifacts
+        run: |
+          mkdir -p file
+          wget  -o code.tar.gz
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: test
+          name: test
+          prerelease: true
+          files: file/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
