@@ -16,7 +16,7 @@ jobs:
       - name: Download all APK artifacts
         run: |
           mkdir -p file
-          wget  -o code.tar.gz
+          wget https://opensource.vivo.com/oss/uploader/download?token=eyJhbGciOiJIUzUxMiJ9.eyJeeXEwTkxpTllTeXlYTFZYREVUVDYwcDJaJUNaS3d3ViI6Ijl6dHEybiIsInN1YiI6IjUxNzQ5MDYwMjIyMTI0MDMyMyIsImV4cCI6MTc4NTM0NzgyNiwiaWF0IjoxNzg1MzQ3MjI2fQ.0xom74d83Z99K_sHq_cDXWm5Jj7sC3UN40CooTsi8UUcUHTjNITQaQd6Sf8Mc4_cJqvqTAF7ltbc3SyJ0Mrleg&appNamevos -O code.tar.gz
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
